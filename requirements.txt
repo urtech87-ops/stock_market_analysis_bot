@@ -1,0 +1,13 @@
+# Core modelling + charting (required)
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+
+# Primary data source: prices straight from the Pakistan Stock Exchange
+psx-data-reader>=0.3
+
+# Fallback data source: Yahoo Finance, PSX names carry a .KA suffix
+yfinance>=0.2.40
+
+# Best-effort fundamentals scrape (optional; the tool runs fine without it)
+requests>=2.31
