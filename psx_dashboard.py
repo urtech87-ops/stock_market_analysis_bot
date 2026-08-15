@@ -34,6 +34,20 @@ CONFIG = {
     "MIN_ROWS": 400,         # a ticker with fewer rows than this is REJECTED,
                              # not patched. ~400 trading days ≈ 1.6 years.
 
+    # --- Data quality --------------------------------------------------------
+    # A single-day move bigger than this is treated as bad INPUT DATA, not as a
+    # real market move: on PSX it is almost always an unadjusted stock split or
+    # a corrupted tick. One such row is enough to wreck every statistic built on
+    # top of it — a bad LUCK row made its full-sample annualised volatility read
+    # 198.5%. Offending rows are dropped and listed by date; nothing is ever
+    # discarded silently.
+    "MAX_DAILY_MOVE_PCT": 40.0,
+    # A bad tick is one row. A long chain of them is not noise — it means the
+    # series contains a genuine, unadjusted level shift, which dropping rows
+    # cannot repair. Past this many drops the SOURCE is rejected outright so the
+    # next one is tried, rather than the series being patched into shape.
+    "MAX_SPIKE_DROPS": 10,
+
     # --- Forecast horizon ----------------------------------------------------
     "HORIZON_TRADING_DAYS": 42,   # ≈ 59 calendar days (PSX trades 5 days/week).
                                   # The app's slider takes calendar days and
@@ -271,12 +285,67 @@ class PriceData:
     source: str               # which source actually produced this data
 
 
+def _annualised_vol(s: pd.Series) -> Optional[float]:
+    """Annualised volatility of a close series, or None if it is too short.
+
+    Same definition the report uses: the standard deviation of daily LOG
+    returns, scaled by sqrt(252). Computed here as well so the effect of
+    cleaning can be shown as a before/after pair at load time.
+    """
+    log_ret = np.log(s / s.shift(1)).dropna()
+    if len(log_ret) < 2:
+        return None
+    return float(log_ret.std(ddof=1)) * math.sqrt(TRADING_DAYS_PER_YEAR)
+
+
+def _drop_return_spikes(s: pd.Series, max_move_pct: float, max_drops: int,
+                        ticker: str, source: str) -> tuple[pd.Series, list]:
+    """Remove single-day moves too large to be a real price move.
+
+    A corrupted tick shows up as one absurd move immediately followed by its
+    mirror image, so it is the ROW that is dropped, not the return: the days on
+    either side are then re-linked across the gap. Returns are recomputed after
+    every drop, because removing one row changes the return of the day after it.
+
+    Returns (cleaned series, [(date, close, move) removed]). Raises
+    DataQualityError once `max_drops` is exceeded — at that point the series has
+    a sustained level shift in it rather than isolated bad ticks, and quietly
+    deleting a run of rows would be inventing a history that never traded.
+    """
+    limit = max_move_pct / 100.0
+    removed: list[tuple[pd.Timestamp, float, float]] = []
+
+    while len(s) > 2:
+        move = s / s.shift(1) - 1.0
+        offenders = move.index[move.abs() > limit]
+        if len(offenders) == 0:
+            break
+
+        stamp = offenders[0]
+        removed.append((stamp, float(s.loc[stamp]), float(move.loc[stamp])))
+        s = s.drop(stamp)
+
+        if len(removed) > max_drops:
+            listed = ", ".join(str(d.date()) for d, _, _ in removed)
+            raise DataQualityError(
+                f"{source} gave {ticker} more than {max_drops} single-day moves "
+                f"beyond ±{max_move_pct:.0f}% ({listed}). That is an unadjusted "
+                f"split or a broken feed, not isolated bad ticks; this source is "
+                f"rejected rather than patched."
+            )
+
+    return s, removed
+
+
 def _clean_and_validate(raw: pd.Series, ticker: str, source: str,
-                        min_rows: int) -> pd.Series:
+                        min_rows: int, max_move_pct: float = 40.0,
+                        max_spike_drops: int = 10,
+                        say: Optional[callable] = None) -> pd.Series:
     """Turn whatever a source returned into a trustworthy close series, or raise.
 
     Fail-loud on purpose: it is far better to skip a ticker than to model
-    fabricated or half-empty data.
+    fabricated or half-empty data. Every row this drops is announced through
+    `say`, so a discarded price is always visible in the run log.
     """
     s = pd.Series(raw).copy()
 
@@ -288,6 +357,20 @@ def _clean_and_validate(raw: pd.Series, ticker: str, source: str,
     s = pd.to_numeric(s, errors="coerce").dropna()
     s = s[s > 0]                                    # a price <= 0 is bad data
     s = s[~s.index.duplicated(keep="last")].sort_index()
+
+    # Spike filter runs BEFORE the length check, so a series that only clears
+    # MIN_ROWS by counting corrupted rows is still rejected.
+    vol_before = _annualised_vol(s)
+    s, spikes = _drop_return_spikes(s, max_move_pct, max_spike_drops,
+                                    ticker, source)
+
+    if spikes and say is not None:
+        say(f"  [CLEAN] {ticker}: dropped {len(spikes)} row(s) from {source} "
+            f"with a single-day move beyond ±{max_move_pct:.0f}% "
+            f"(bad tick or unadjusted split, not a real move):")
+        for stamp, price, move in spikes:
+            say(f"          {stamp.date()}  close {price:,.2f}  "
+                f"move {move * 100:+.1f}%")
 
     if len(s) < min_rows:
         raise DataQualityError(
@@ -302,6 +385,17 @@ def _clean_and_validate(raw: pd.Series, ticker: str, source: str,
             f"{source} returned {s.nunique()} distinct prices for {ticker}; "
             f"that is a stale or broken feed, not a tradable series."
         )
+
+    # The figure the report will quote as "full sample" volatility, printed
+    # here so the effect of the cleaning above can be read at a glance.
+    vol_after = _annualised_vol(s)
+    if say is not None and vol_after is not None:
+        line = (f"  [VOL]   {ticker}: annualised volatility after cleaning "
+                f"{vol_after * 100:.1f}% (full sample, {len(s)} rows)")
+        if spikes and vol_before is not None:
+            line += (f" — was {vol_before * 100:.1f}% with the "
+                     f"{len(spikes)} dropped row(s) still in")
+        say(line)
 
     return s.astype(float)
 
@@ -327,6 +421,11 @@ _PSX_CLOSE_NAMES = ("Close", "CLOSE", "Close Price", "Closing Price", "Price",
 # the reader downloads one page per calendar month, so anything noisier would
 # bury the report.
 _PSX_SHAPES_SEEN: set[str] = set()
+
+# The headers on the most recent page parsed, kept so a failure deeper inside
+# the library can say what the exchange actually served. An empty list means the
+# page had no table at all.
+_PSX_LAST_HEADERS: list[str] = []
 
 
 def _report_psx_shape(what: str, names: list) -> None:
@@ -354,6 +453,7 @@ def _tolerant_toframe(self, data) -> pd.DataFrame:
     """
     headers = [str(h.getText()).strip() for h in data.select("th")]
     _report_psx_shape("headers on the exchange page", headers)
+    _PSX_LAST_HEADERS[:] = headers
 
     if not headers:
         return pd.DataFrame()
@@ -397,6 +497,18 @@ def _psx_frame(ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
     reader_cls.toframe = _tolerant_toframe
     try:
         return stocks(ticker, start=start, end=end)
+    except Exception as exc:                            # noqa: BLE001
+        # The library runs its own preprocess step after our parser hands the
+        # rows back, and that step assumes the page had a table with a VOLUME
+        # column. When the exchange serves nothing usable it dies in there with
+        # an error naming none of that ("no attribute 'Volume'"), so translate
+        # it into a message that says what actually happened. load_prices then
+        # reports it against this source and moves on to yfinance.
+        raise DataQualityError(
+            f"psx-data-reader could not build a price table for {ticker}: "
+            f"{type(exc).__name__}: {exc}. Headers on the last exchange page "
+            f"parsed: {_PSX_LAST_HEADERS or '[] (the page served no table)'}."
+        ) from exc
     finally:
         reader_cls.toframe = original
 
@@ -519,7 +631,11 @@ def load_prices(ticker: str, cfg: dict,
     for source_name, getter in attempts:
         try:
             raw = getter()
-            close = _clean_and_validate(raw, ticker, source_name, cfg["MIN_ROWS"])
+            close = _clean_and_validate(
+                raw, ticker, source_name, cfg["MIN_ROWS"],
+                max_move_pct=cfg.get("MAX_DAILY_MOVE_PCT", 40.0),
+                max_spike_drops=cfg.get("MAX_SPIKE_DROPS", 10),
+                say=say)
         except Exception as exc:                       # noqa: BLE001 - report all
             failures.append(f"    - {source_name}: {type(exc).__name__}: {exc}")
             continue
