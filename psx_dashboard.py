@@ -7,6 +7,10 @@ What this tool does:
   * Measures what is factually true today (price, volatility, trend, momentum).
   * Models how uncertain the next ~60 calendar days are, as a RANGE, never a number.
   * Models the three stocks together, with their real correlations, as a basket.
+  * Separately, and clearly marked as such, adds up an EXPECTED RETURN from
+    assumptions you supply (dividend + growth + re-rating, less depreciation and
+    inflation). That panel is an estimate conditional on those assumptions, not
+    a measurement of anything.
 
 What this tool explicitly does NOT do:
   * It never outputs a single future price as a prediction.
@@ -74,6 +78,25 @@ CONFIG = {
     # Fractional share counts are used deliberately: this is a MODEL of a basket,
     # not a broker order. Real PSX lots are whole shares.
 
+    # --- Expected-return assumptions (NOT measurements) ----------------------
+    # These drive the EXPECTED RETURN panel only. The data layer, the Monte
+    # Carlo cone and the portfolio simulation never read them, so editing these
+    # cannot move a single measured or simulated number. Each one is an
+    # ASSUMPTION about the whole horizon; check it against your own view before
+    # leaning on the panel.
+    "INFLATION_PCT": 8.0,           # headline CPI has been running around 9%
+                                    # and the SBP target band is 5-7%; this
+                                    # sits between them. Verify it yourself.
+    "PKR_DEPRECIATION_PCT": 6.5,    # long-run historical PKR/USD depreciation,
+                                    # per year. Verify it yourself.
+    "SCENARIO_BAND_PP": 4.0,        # +/- percentage points applied to the
+                                    # annual nominal rate to build the
+                                    # low / central / high range.
+    # Per-stock building blocks fall back to these when neither the web scrape
+    # nor the FUNDAMENTALS block below has a number for a ticker.
+    "DEFAULT_EARNINGS_GROWTH_PCT": 10.0,
+    "DEFAULT_RERATING_PCT": 0.0,
+
     # --- Data sources --------------------------------------------------------
     # Order is: psx-data-reader  ->  yfinance (.KA)  ->  your local CSV.
     "USE_PSX_READER": True,
@@ -110,6 +133,8 @@ CONFIG = {
 #       "pe": 4.2,                  # price / earnings, trailing
 #       "eps": 51.0,                # earnings per share, PKR
 #       "dividend_yield_pct": 8.5,  # annual dividend / price, in PERCENT
+#       "earnings_growth_pct": 10.0,# assumed NOMINAL annual earnings growth, %
+#       "rerating_pct": 0.0,        # assumed annual change in the multiple, %
 #       "debt_to_equity": 0.15,     # total debt / shareholder equity
 #       "roe_pct": 22.0,            # return on equity, in PERCENT
 #       "target_avg": 260.0,        # 12-month analyst target, PKR
@@ -121,11 +146,19 @@ CONFIG = {
 # The analyst targets below are 12-month CONSENSUS figures supplied by the user
 # of this tool, not measured or verified by it. They are other people's opinions
 # about a horizon roughly six times longer than the cone this tool simulates.
+#
+# earnings_growth_pct and rerating_pct are used ONLY by the EXPECTED RETURN
+# panel. They are assumptions, not measurements and not scraped from anywhere:
+# they ship at the CONFIG defaults (10% growth, 0% re-rating) so the panel is
+# transparent about starting from a generic figure rather than a researched one.
+# Put your own numbers here per ticker.
 FUNDAMENTALS = {
     "OGDC": {
         "pe": None,
         "eps": None,
         "dividend_yield_pct": None,
+        "earnings_growth_pct": 10.0,   # assumption, not researched — edit me
+        "rerating_pct": 0.0,           # assumption, not researched — edit me
         "debt_to_equity": None,
         "roe_pct": None,
         "target_avg": 394.0,
@@ -137,6 +170,8 @@ FUNDAMENTALS = {
         "pe": None,
         "eps": None,
         "dividend_yield_pct": None,
+        "earnings_growth_pct": 10.0,   # assumption, not researched — edit me
+        "rerating_pct": 0.0,           # assumption, not researched — edit me
         "debt_to_equity": None,
         "roe_pct": None,
         "target_avg": 612.0,
@@ -148,6 +183,8 @@ FUNDAMENTALS = {
         "pe": None,
         "eps": None,
         "dividend_yield_pct": None,
+        "earnings_growth_pct": 10.0,   # assumption, not researched — edit me
+        "rerating_pct": 0.0,           # assumption, not researched — edit me
         "debt_to_equity": None,
         "roe_pct": None,
         "target_avg": 592.0,
@@ -806,8 +843,9 @@ def profile_stock(pd_obj: PriceData, cfg: dict) -> StockStats:
 # 3. FUNDAMENTALS — best-effort web, then your config, then say "unavailable"
 # =============================================================================
 
-FUNDAMENTAL_FIELDS = ("pe", "eps", "dividend_yield_pct", "debt_to_equity",
-                      "roe_pct", "target_avg", "target_high", "target_low")
+FUNDAMENTAL_FIELDS = ("pe", "eps", "dividend_yield_pct", "earnings_growth_pct",
+                      "rerating_pct", "debt_to_equity", "roe_pct",
+                      "target_avg", "target_high", "target_low")
 
 # Labels as they appear on stockanalysis.com quote pages.
 _WEB_LABEL_MAP = {
@@ -1130,6 +1168,190 @@ def run_portfolio(profiles: list[StockStats], cfg: dict,
         drift_label=DRIFT_SCENARIO_LABELS[scenario],
         values=values,
     )
+
+
+# =============================================================================
+# 5B. EXPECTED RETURN — an ESTIMATE built from assumptions, not a measurement
+# =============================================================================
+#
+# This sits BESIDE the Monte Carlo cone, never inside it, and the two answer
+# different questions. The cone models randomness around today's price and
+# takes no view on direction. The panel below takes an explicit view — supplied
+# by you, as numbers you can edit — and compounds it:
+#
+#     annual_nominal_pkr = dividend_yield + earnings_growth + rerating
+#     annual_usd         = (1 + annual_nominal_pkr) / (1 + pkr_depreciation) - 1
+#     annual_real        = (1 + annual_nominal_pkr) / (1 + inflation)        - 1
+#     total over D days  = (1 + annual_x) ** (D / 365) - 1
+#
+# Nothing here is measured, simulated, scraped or verified. It is arithmetic on
+# your assumptions and it is worth exactly as much as they are. Every figure is
+# reported as a LOW / CENTRAL / HIGH range so no single number ever stands on
+# its own, and every assumption that produced it is printed alongside it.
+
+DAYS_PER_CALENDAR_YEAR = 365.0
+
+# The three building blocks, in the order they are added together. The second
+# element is the CONFIG key holding the fallback when a ticker supplies nothing;
+# None means the fallback is a plain zero.
+EXPECTED_RETURN_BLOCKS = (
+    ("dividend_yield_pct", None, "Dividend yield"),
+    ("earnings_growth_pct", "DEFAULT_EARNINGS_GROWTH_PCT",
+     "Earnings growth (nominal)"),
+    ("rerating_pct", "DEFAULT_RERATING_PCT", "Re-rating"),
+)
+
+# The three lenses the same annual rate is shown through.
+EXPECTED_RETURN_LENSES = ("nominal_pkr", "usd", "real")
+
+EXPECTED_RETURN_LENS_LABELS = {
+    "nominal_pkr": "Nominal PKR",
+    "usd": "US dollars",
+    "real": "Real purchasing power",
+}
+
+BASKET_LABEL = "Equal-weighted basket"
+
+
+@dataclass
+class ReturnBlock:
+    """One building block of the assumed annual return, with its provenance."""
+    field: str
+    label: str
+    pct: float
+    origin: str     # "web" | "your config" | "not supplied — assumed 0" | ...
+
+
+@dataclass
+class ExpectedReturn:
+    """The assumption-driven estimate for one stock, or for the basket."""
+    label: str                  # ticker, or BASKET_LABEL
+    horizon_days: int           # CALENDAR days the estimate is compounded over
+    years: float                # horizon_days / 365
+    blocks: list[ReturnBlock]   # what was added up to get the annual rate
+    annual_nominal_pkr: float   # the central annual rate, as a fraction
+    band_pp: float              # +/- percentage points behind low / high
+    inflation: float            # annual, as a fraction
+    depreciation: float         # annual, as a fraction
+    annual: dict                # lens -> {"low": r, "central": r, "high": r}
+    totals: dict                # lens -> {"low": r, "central": r, "high": r}
+
+
+def _annual_in_lens(annual_nominal_pkr: float, lens: str,
+                    inflation: float, depreciation: float) -> float:
+    """Convert one annual nominal PKR rate into the lens asked for."""
+    if lens == "nominal_pkr":
+        return annual_nominal_pkr
+    if lens == "usd":
+        return (1.0 + annual_nominal_pkr) / (1.0 + depreciation) - 1.0
+    if lens == "real":
+        return (1.0 + annual_nominal_pkr) / (1.0 + inflation) - 1.0
+    raise ValueError(f"Unknown lens {lens!r}; expected one of "
+                     f"{list(EXPECTED_RETURN_LENSES)}.")
+
+
+def expected_return_blocks(fund: Fundamentals, cfg: dict) -> list[ReturnBlock]:
+    """The three building blocks for one ticker, each labelled with its source.
+
+    A block the web scrape and your config both leave empty is not invented and
+    not skipped: it falls back to the CONFIG default and says so on its own line,
+    so a missing dividend yield reads as an assumed zero rather than as a fact.
+    """
+    blocks = []
+    for field_name, cfg_key, label in EXPECTED_RETURN_BLOCKS:
+        default = 0.0 if cfg_key is None else float(cfg[cfg_key])
+        if fund is not None and field_name in fund.values:
+            blocks.append(ReturnBlock(field_name, label,
+                                      float(fund.values[field_name]),
+                                      fund.origin[field_name]))
+        else:
+            blocks.append(ReturnBlock(field_name, label, default,
+                                      f"not supplied — assumed {default:g}"))
+    return blocks
+
+
+def build_expected_return(label: str, blocks: list[ReturnBlock],
+                          cfg: dict) -> ExpectedReturn:
+    """Compound the assumed annual rate over the horizon, in all three lenses."""
+    horizon_days = trading_days_to_calendar_days(cfg["HORIZON_TRADING_DAYS"])
+    years = horizon_days / DAYS_PER_CALENDAR_YEAR
+
+    annual_nominal = sum(b.pct for b in blocks) / 100.0
+    band = float(cfg["SCENARIO_BAND_PP"]) / 100.0
+    inflation = float(cfg["INFLATION_PCT"]) / 100.0
+    depreciation = float(cfg["PKR_DEPRECIATION_PCT"]) / 100.0
+
+    # The band is applied to the NOMINAL rate first, then converted, then
+    # compounded — so low/central/high stay three versions of one assumption
+    # rather than three unrelated numbers.
+    scenarios = {"low": annual_nominal - band,
+                 "central": annual_nominal,
+                 "high": annual_nominal + band}
+
+    annual: dict = {}
+    totals: dict = {}
+    for lens in EXPECTED_RETURN_LENSES:
+        annual[lens] = {k: _annual_in_lens(v, lens, inflation, depreciation)
+                        for k, v in scenarios.items()}
+        totals[lens] = {k: (1.0 + r) ** years - 1.0
+                        for k, r in annual[lens].items()}
+
+    return ExpectedReturn(
+        label=label,
+        horizon_days=horizon_days,
+        years=years,
+        blocks=blocks,
+        annual_nominal_pkr=annual_nominal,
+        band_pp=float(cfg["SCENARIO_BAND_PP"]),
+        inflation=inflation,
+        depreciation=depreciation,
+        annual=annual,
+        totals=totals,
+    )
+
+
+def expected_return_for_stock(ticker: str, fund: Fundamentals,
+                              cfg: dict) -> ExpectedReturn:
+    return build_expected_return(ticker, expected_return_blocks(fund, cfg), cfg)
+
+
+def expected_return_for_basket(per_stock: list[ExpectedReturn],
+                               cfg: dict) -> Optional[ExpectedReturn]:
+    """The same estimate for an equal-weighted basket of the surviving names.
+
+    Equal capital per name means each name's assumed rate carries equal weight,
+    so the basket's blocks are the plain averages of the individual blocks.
+    """
+    if len(per_stock) < 2:
+        return None
+
+    n = len(per_stock)
+    averaged = []
+    for i, (field_name, _cfg_key, label) in enumerate(EXPECTED_RETURN_BLOCKS):
+        mean_pct = sum(e.blocks[i].pct for e in per_stock) / n
+        averaged.append(ReturnBlock(
+            field_name, label, mean_pct,
+            f"equal-weighted average of {n} names"))
+    return build_expected_return(BASKET_LABEL, averaged, cfg)
+
+
+def cone_width_pct_for(result: "AnalysisResult",
+                       ticker: Optional[str] = None) -> Optional[float]:
+    """Width of the Monte Carlo 80% band at this horizon, in percent.
+
+    Pass a ticker for that stock's cone under the selected drift scenario, or
+    nothing for the basket's band. Returns None when there is no such cone. This
+    reads the simulation's existing output; it changes nothing about it.
+    """
+    if ticker is None:
+        port = result.portfolio
+        return None if port is None else port.band80_width_pct
+
+    cone = result.primary_cones.get(ticker)
+    stats = next((p for p in result.profiles if p.ticker == ticker), None)
+    if cone is None or stats is None:
+        return None
+    return band80_width_pct(cone, stats.last_close)
 
 
 # =============================================================================
@@ -1586,6 +1808,160 @@ def diversification_paragraph(port: PortfolioResult) -> str:
     )
 
 
+# -----------------------------------------------------------------------------
+# EXPECTED RETURN panel — rows and sentences, shared by the CLI and the app.
+# -----------------------------------------------------------------------------
+
+EXPECTED_RETURN_HEADING = "EXPECTED RETURN — AN ESTIMATE FROM YOUR ASSUMPTIONS"
+
+
+@dataclass
+class ReturnRow:
+    """One lens of the expected-return table, already formatted for display."""
+    lens: str
+    label: str
+    low: str
+    central: str
+    high: str
+    note: str
+
+
+def _pct(x: float) -> str:
+    """A signed percentage. Expected returns can be negative; show the sign."""
+    return f"{x * 100:+.1f}%"
+
+
+def expected_return_rows(exp: ExpectedReturn) -> list[ReturnRow]:
+    """The three-lens table. Every lens carries its low and high, always."""
+    notes = {
+        "nominal_pkr": "rupees, before inflation and before any currency move",
+        "usd": f"after PKR/USD depreciation of "
+               f"{exp.depreciation * 100:.1f}% a year",
+        "real": f"after inflation of {exp.inflation * 100:.1f}% a year",
+    }
+    rows = []
+    for lens in EXPECTED_RETURN_LENSES:
+        t = exp.totals[lens]
+        rows.append(ReturnRow(
+            lens=lens,
+            label=EXPECTED_RETURN_LENS_LABELS[lens],
+            low=_pct(t["low"]),
+            central=_pct(t["central"]),
+            high=_pct(t["high"]),
+            note=notes[lens],
+        ))
+    return rows
+
+
+def expected_return_assumption_line(exp: ExpectedReturn) -> str:
+    """Every assumption behind the numbers, printed inline with them."""
+    parts = " + ".join(f"{b.label.lower()} {b.pct:.1f}% ({b.origin})"
+                       for b in exp.blocks)
+    return (
+        f"Built from {parts} = {exp.annual_nominal_pkr * 100:.1f}% a year "
+        f"nominal in rupees, then compounded over {exp.horizon_days} calendar "
+        f"days ({exp.years:.2f} of a year). Also assumed: inflation "
+        f"{exp.inflation * 100:.1f}% a year, PKR depreciation "
+        f"{exp.depreciation * 100:.1f}% a year, and a scenario band of "
+        f"+/-{exp.band_pp:.1f} percentage points on the annual nominal rate, "
+        f"which is what separates LOW from HIGH."
+    )
+
+
+def expected_return_note(exp: ExpectedReturn) -> str:
+    """The one-line honesty note that travels with every expected-return table."""
+    return (
+        "This is conditional on those assumptions holding for the whole "
+        "horizon, real results vary far more widely than the low-high range "
+        "above, and the dollar and real figures come out well below the "
+        "nominal rupee figure because depreciation and inflation are taken "
+        "out of it."
+    )
+
+
+def randomness_vs_edge_line(exp: ExpectedReturn,
+                            cone_width_pct: Optional[float]) -> Optional[str]:
+    """Compare the width of the Monte Carlo cone against the expected edge.
+
+    This is the short-horizon-versus-long-horizon signal. Over a few weeks the
+    80% band is usually far wider than anything the building blocks can add up
+    to, which means the outcome is mostly noise; stretch the horizon and the
+    assumed return grows while the band grows more slowly.
+
+    Note what is being compared: the cone width is the P10-P90 SPREAD, a
+    two-sided range, while the expected return is a single level. They are not
+    the same kind of quantity, so read this as a rough noise-to-signal ratio
+    rather than as an exact comparison.
+    """
+    if cone_width_pct is None:
+        return None
+
+    central = exp.totals["nominal_pkr"]["central"] * 100.0
+    if cone_width_pct > abs(central):
+        return (
+            "At this horizon, randomness dominates the expected edge — treat "
+            "the estimate as weak. The Monte Carlo 80% band spans "
+            f"{cone_width_pct:.1f}% of today's value against a central "
+            f"expected nominal return of {central:+.1f}%."
+        )
+    return (
+        f"At this horizon the central expected nominal return ({central:+.1f}%) "
+        f"is larger than the Monte Carlo 80% band ({cone_width_pct:.1f}% of "
+        f"today's value), so the assumptions matter more than the randomness "
+        f"does — for as long as they hold."
+    )
+
+
+EXPECTED_RETURN_PREAMBLE = (
+    "Everything below is an ESTIMATE built by adding up assumptions you can "
+    "edit, then compounding them. It is not measured, not simulated, and not a "
+    "prediction. It sits beside the uncertainty cone rather than inside it, "
+    "because the two answer different questions: the cone describes how wide "
+    "the range of outcomes is when no view on direction is taken, while this "
+    "panel says what the assumed direction adds up to if it holds. Each figure "
+    "is shown as a low, central and high range, and the assumptions that "
+    "produced it are printed next to it so you can disagree with them "
+    "specifically."
+)
+
+
+def report_expected_return(result: "AnalysisResult") -> None:
+    """Print the expected-return panel for every stock and for the basket."""
+    if not result.expected_returns:
+        return
+
+    emit()
+    emit.rule("=")
+    emit(f" {EXPECTED_RETURN_HEADING}")
+    emit.rule("=")
+    emit()
+    emit.wrap(EXPECTED_RETURN_PREAMBLE, width=76, indent="  ")
+
+    entries = [(p.ticker, result.expected_returns[p.ticker], p.ticker)
+               for p in result.profiles if p.ticker in result.expected_returns]
+    if result.expected_basket is not None:
+        entries.append((None, result.expected_basket, BASKET_LABEL))
+
+    for ticker, exp, label in entries:
+        emit()
+        emit(f"  {label} — expected TOTAL return over ~{exp.horizon_days} "
+             f"calendar days")
+        emit.wrap(expected_return_assumption_line(exp), width=74,
+                  indent="      ")
+        emit()
+        emit(f"      {'Lens':<24}{'LOW':>10}{'CENTRAL':>10}{'HIGH':>10}")
+        for row in expected_return_rows(exp):
+            emit(f"      {row.label:<24}{row.low:>10}{row.central:>10}"
+                 f"{row.high:>10}")
+            emit.wrap(row.note, width=70, indent="          ")
+        emit()
+        emit.wrap(expected_return_note(exp), width=74, indent="      ")
+        line = randomness_vs_edge_line(exp, cone_width_pct_for(result, ticker))
+        if line:
+            emit()
+            emit.wrap(line, width=74, indent="      ")
+
+
 def closing_paragraphs(profiles: list[StockStats],
                        port: Optional[PortfolioResult],
                        cfg: dict) -> list[str]:
@@ -1681,6 +2057,10 @@ class AnalysisResult:
     requested: list[str]                        # tickers asked for
     skipped: list[str]                          # tickers with no usable data
     drift_scenario: str
+    # The expected-return panel: an assumption-driven ESTIMATE kept deliberately
+    # apart from the simulated cones above it.
+    expected_returns: dict = field(default_factory=dict)   # ticker -> ExpectedReturn
+    expected_basket: Optional[ExpectedReturn] = None
     log: list[str] = field(default_factory=list)
     figures: dict = field(default_factory=dict, repr=False)
 
@@ -1795,10 +2175,22 @@ def run_analysis(tickers: Optional[list[str]] = None,
                          log=collected)
     drain(collected)
 
+    # ---- 4b. Expected return -------------------------------------------------
+    # Arithmetic on the assumptions in CONFIG and FUNDAMENTALS. It reads none of
+    # the simulation state above and feeds none of it, which is the point.
+    say("      + expected-return estimate from your assumptions "
+        "(not measured, not simulated)")
+    expected = {p.ticker: expected_return_for_stock(p.ticker, funds[p.ticker],
+                                                    cfg)
+                for p in profiles}
+    expected_basket = expected_return_for_basket(
+        [expected[p.ticker] for p in profiles], cfg)
+
     result = AnalysisResult(
         cfg=cfg, profiles=profiles, fundamentals=funds, cones=all_cones,
         primary_cones=primary_cones, portfolio=port, requested=requested,
-        skipped=skipped, drift_scenario=scenario, log=log,
+        skipped=skipped, drift_scenario=scenario,
+        expected_returns=expected, expected_basket=expected_basket, log=log,
     )
 
     # ---- 5. Charts -----------------------------------------------------------
@@ -1861,6 +2253,8 @@ def report_run(result: AnalysisResult) -> None:
         emit()
         emit("  Portfolio view skipped: it needs at least 2 tickers with usable "
              "data.")
+
+    report_expected_return(result)
 
     closing_paragraph(result.profiles, result.portfolio, cfg)
 
