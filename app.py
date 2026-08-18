@@ -7,9 +7,11 @@ from psx_dashboard.run_analysis(), the same function the command line uses, so
 the two can never disagree with each other.
 
 It also keeps the same promise the CLI makes: no forward-looking number is shown
-on its own. Percentiles are always rendered as a full P10-P90 row, and every
-string that reaches the page is passed through psx_dashboard.assert_honest(),
-which raises if overpromising language ever appears.
+on its own. Percentiles are always rendered as a full P10-P90 row, the
+expected-return panel is always rendered as a low/central/high range with its
+assumptions printed beside it, and every string that reaches the page is passed
+through psx_dashboard.assert_honest(), which raises if overpromising language
+ever appears.
 
 Run:  streamlit run app.py
 """
@@ -93,6 +95,30 @@ with st.sidebar:
         help="Both scenarios are always computed and reported. This chooses "
              "which one the charts and the portfolio model are built on.")
 
+    with st.expander("Assumptions — the expected-return panel only"):
+        caption("These drive the EXPECTED RETURN panel and nothing else. They "
+                "cannot move a measured statistic or a simulated cone. Each is "
+                "an assumption about the whole horizon — check it against your "
+                "own view.")
+        inflation_pct = st.number_input(
+            "Inflation, % a year", min_value=0.0, max_value=100.0,
+            value=float(dash.CONFIG["INFLATION_PCT"]), step=0.5,
+            help="Used for the real purchasing-power lens. Headline CPI has "
+                 "been running around 9% and the SBP target band is 5-7%; "
+                 "verify the number you use.")
+        pkr_depreciation_pct = st.number_input(
+            "PKR depreciation vs USD, % a year", min_value=0.0, max_value=100.0,
+            value=float(dash.CONFIG["PKR_DEPRECIATION_PCT"]), step=0.5,
+            help="Used for the US dollar lens. The default is the long-run "
+                 "historical rate; verify it before relying on it.")
+        scenario_band_pp = st.number_input(
+            "Scenario band, +/- percentage points", min_value=0.0,
+            max_value=50.0, value=float(dash.CONFIG["SCENARIO_BAND_PP"]),
+            step=0.5,
+            help="Applied to the annual nominal rate to build the low and high "
+                 "ends. A wider band means you are less sure of the central "
+                 "assumption.")
+
     with st.expander("Advanced"):
         try_web = st.checkbox(
             "Try the web fundamentals lookup",
@@ -127,7 +153,10 @@ if run_clicked:
                     tickers=tickers, horizon_days=horizon_days,
                     capital_per_stock=capital_per_stock, usd_pkr=usd_pkr,
                     drift_scenario=drift_scenario,
-                    overrides={"TRY_WEB_FUNDAMENTALS": try_web})
+                    overrides={"TRY_WEB_FUNDAMENTALS": try_web,
+                               "INFLATION_PCT": inflation_pct,
+                               "PKR_DEPRECIATION_PCT": pkr_depreciation_pct,
+                               "SCENARIO_BAND_PP": scenario_band_pp})
                 st.session_state["result"] = dash.run_analysis(
                     cfg=cfg, with_figures=True)
             except Exception as exc:                        # noqa: BLE001
@@ -141,8 +170,10 @@ if run_clicked:
 
 st.title("PSX portfolio risk & context dashboard")
 md("This tool reports **measured facts** and **ranges**. It never presents a "
-   "single future price as a prediction, and every forward-looking figure below "
-   "is a percentile shown with the rest of its range.")
+   "single future price as a prediction: the simulated figures below are "
+   "percentiles shown with the rest of their range, and the expected-return "
+   "panel at the end is an **estimate conditional on assumptions you can "
+   "edit**, shown as a low-to-high range rather than as one number.")
 
 result = st.session_state.get("result")
 
@@ -326,6 +357,38 @@ else:
             f"{port.diversification_benefit_pct:.1f}%",
     }])
     md(dash.diversification_paragraph(port))
+
+
+# ---- Expected return --------------------------------------------------------
+#
+# Deliberately its own section, after the cones rather than inside them: this is
+# arithmetic on assumptions, and the cones are simulated randomness.
+
+if result.expected_returns:
+    st.divider()
+    st.header("Expected return — an estimate from your assumptions")
+    md(dash.EXPECTED_RETURN_PREAMBLE)
+
+    entries = [(p.ticker, result.expected_returns[p.ticker], p.ticker)
+               for p in result.profiles if p.ticker in result.expected_returns]
+    if result.expected_basket is not None:
+        entries.append((None, result.expected_basket, dash.BASKET_LABEL))
+
+    for ticker, exp, label in entries:
+        md(f"**{label}** — expected **total** return over ~{exp.horizon_days} "
+           f"calendar days")
+        caption(dash.expected_return_assumption_line(exp))
+        table([{"Lens": row.label,
+                "LOW": row.low,
+                "CENTRAL": row.central,
+                "HIGH": row.high,
+                "What the lens means": row.note}
+               for row in dash.expected_return_rows(exp)])
+        md(dash.expected_return_note(exp))
+        line = dash.randomness_vs_edge_line(
+            exp, dash.cone_width_pct_for(result, ticker))
+        if line:
+            md(line)
 
 
 # ---- Closing framing --------------------------------------------------------

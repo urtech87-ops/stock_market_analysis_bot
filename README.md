@@ -9,6 +9,7 @@ separate on purpose:
 | **FACT** | What is factually true about this stock today? | measured from real price history |
 | **UNCERTAINTY** | How wide is the range of plausible outcomes over ~60 days? | Monte Carlo simulation |
 | **EXTERNAL VIEW** | What do other people think? | analyst targets you supply / scrape |
+| **EXPECTED RETURN** | If my assumptions hold, what does that add up to? | arithmetic on assumptions you edit |
 
 **It never presents a single future price as a prediction.** Every forward-looking
 number is a percentile, always quoted with its range. A guard in the code
@@ -37,6 +38,9 @@ This opens the dashboard in your browser. The sidebar controls the whole run:
 - **Drift scenario** — zero drift (default) or historical drift. Both scenarios
   are always computed and shown; this chooses which one the charts and the
   portfolio model are built on.
+- **Assumptions** (expander) — inflation, PKR/USD depreciation and the scenario
+  band that drive the expected-return panel. They touch nothing else: no
+  measured statistic and no simulated cone reads them.
 
 Press **Run analysis** and, per stock, you get the FACT table, the fan chart
 with the analyst-target markers, and the full P10-P90 uncertainty range,
@@ -75,6 +79,8 @@ result.profiles                   # measured StockStats per surviving ticker
 result.cones["OGDC"]["zero"].pct  # {10: …, 25: …, 50: …, 75: …, 90: …}
 result.portfolio.pct              # basket value percentiles, PKR
 result.figures["fan_OGDC"]        # matplotlib Figure, unsaved
+result.expected_returns["OGDC"]   # assumption-driven ExpectedReturn estimate
+result.expected_basket            # the same, equal-weighted across the names
 result.skipped                    # tickers with no usable data
 result.log                        # the data trail, line by line
 ```
@@ -93,6 +99,9 @@ Everything you would want to change is in the **CONFIG BLOCK** at the top of
 - `STAT_WINDOW_DAYS` — the window volatility and drift are measured over (252 = last year)
 - `CAPITAL_USD_PER_STOCK` ($10) and `USD_PKR` (280)
 - `DRIFT_SCENARIO` — `"zero"` (default) or `"historical"`
+- `INFLATION_PCT` (8.0), `PKR_DEPRECIATION_PCT` (6.5), `SCENARIO_BAND_PP` (4.0)
+  and the `DEFAULT_EARNINGS_GROWTH_PCT` (10.0) / `DEFAULT_RERATING_PCT` (0.0)
+  fallbacks — the expected-return panel's assumptions, and nothing else's
 - `LOCAL_CSV_PATHS` — your own CSVs, used if the live sources fail
 - `FUNDAMENTALS` — per-ticker P/E, EPS, dividend yield, debt/equity, ROE and
   12-month analyst targets (avg/high/low). The valuation fields ship **empty**:
@@ -102,6 +111,38 @@ Everything you would want to change is in the **CONFIG BLOCK** at the top of
   ~Aug 2026 — they are **someone else's opinion, unverified by this tool, and
   worth re-checking before you rely on them**. A web scrape that succeeds takes
   precedence over these config values, and the source is printed either way.
+  `earnings_growth_pct` and `rerating_pct` are read only by the expected-return
+  panel; they ship at the generic CONFIG defaults and every printed line says so.
+
+## The expected-return panel
+
+A **separate, additive** estimate that sits beside the uncertainty cone rather
+than inside it. It is arithmetic on assumptions, not a measurement and not a
+prediction:
+
+```
+annual_nominal_pkr = dividend_yield + earnings_growth + rerating
+annual_usd         = (1 + annual_nominal_pkr) / (1 + pkr_depreciation) - 1
+annual_real        = (1 + annual_nominal_pkr) / (1 + inflation)        - 1
+total over D days  = (1 + annual_x) ** (D / 365) - 1
+```
+
+For each stock and for the equal-weighted basket it prints a three-lens table —
+nominal PKR, US dollars, real purchasing power — each as a **LOW / CENTRAL /
+HIGH** range built by shifting the annual nominal rate by
+`-SCENARIO_BAND_PP / 0 / +SCENARIO_BAND_PP` before converting and compounding.
+No central figure is ever shown without its range. Every assumption behind the
+number is printed inline, including a block nobody supplied, which reads as
+"not supplied — assumed 0" rather than passing for a fact.
+
+The panel also compares itself against the simulation: when the width of the
+Monte Carlo 80% band at this horizon exceeds the central expected return, it
+says so plainly — *"At this horizon, randomness dominates the expected edge —
+treat the estimate as weak."* That is the short-versus-long-horizon signal. Note
+the two quantities are not the same kind: the band is a two-sided P10-P90
+spread, the expected return is a level, so read it as a rough noise-to-signal
+ratio. Nothing in this panel feeds the Monte Carlo, the data layer, or the
+portfolio simulation.
 
 ## Data sources, in order
 
